@@ -1,0 +1,10 @@
+input/*
+result/*
+ref/*
+work/*
+
+# python byte code
+*.pyc
+
+# emacs backups
+*~

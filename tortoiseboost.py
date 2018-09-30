@@ -5,7 +5,7 @@ from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.tree._tree import TREE_LEAF
 from sklearn.metrics import mean_absolute_error
-import cplex
+from scipy import sparse
 
 
 # Utility functions for the TortoiseBoostRegressor
@@ -40,122 +40,75 @@ def change_weights(model, leaves, new_values):
     return
 
 
-class LP_model(object):
+class Solver(object):
     def __init__(self, y, reg_alpha=1.0, n_estimators=10, max_leaf_nodes=3):
-        """Initialize the cplex model used in the TortoiseBoostRegressor.
-        LAD Lasso Regression is used in the fully corrective step and is 
-        implemented as a linear programming problem.."""
-        model = cplex.Cplex()
-        # Set display parameters to avoid output being printed to the terminal.
-        model.parameters.barrier.display.set(0)
-        model.parameters.simplex.display.set(0)
-
-        # Minimize the objective function
-        model.objective.set_sense(model.objective.sense.minimize)
+        """Coordinate descent solver for LAD Lasso Regression"""
         n = y.shape[0]
         J = max_leaf_nodes
         K = n_estimators
 
-        # Create epsilon constraints
-        rhs = list(y)*2
-        senses = 'L'*n + 'G'*n
-        model.linear_constraints.add(rhs=rhs,
-                                     senses=senses)
-        c_epsilon_upper_indices = range(0, n)
-        c_epsilon_lower_indices = range(n, 2*n)
-        
-        # Create delta constraints
-        rhs = [0.0]*2*J*K
-        senses = 'L'*J*K + 'G'*J*K
-        model.linear_constraints.add(rhs=rhs,
-                                     senses=senses)
-        c_delta_upper_indices = range(2*n, 2*n + J*K)
-        c_delta_lower_indices = range(2*n + J*K, 2*n + 2*J*K)
+        design = sparse.hstack(sparse.lil_matrix(K*J, n),
+                               self.reg_alpha * sparse.eye(K*J, format='lil'))
+        design = sparse.vstack([np.hstack(np.full(n, 1),
+                                          np.zeros(K*J)),
+                                design])
+        initial = np.median(y)
+        residuals = np.hstack([y, np.zeros(K*J)]) - initial
+        dd = np.array([-np.sum(np.sign(residuals)),
+                       np.sign(residuals)])
+        dd = np.vstack([dd, np.full((K*J, 2), reg_alpha)])
+        parameters = np.zeros(J*K+1)
+        parameters[0] = initial
+        parameters.shape = (J*K+1, 1)
 
-        # Create epsilon variables
-        objective = [1.0]*n
-        lower_bounds = [0.0]*n
-        upper_bounds = [1e20]*n
-        columns = [cplex.SparsePair(ind=[c_epsilon_upper_indices[i],
-                                         c_epsilon_lower_indices[i]],
-                                    val=[-1.0, 1.0]) for i in range(n)]
-        model.variables.add(obj=objective,
-                            columns=columns,
-                            ub=upper_bounds,
-                            lb=lower_bounds)
-        epsilon_indices = range(n)
-
-        # Create delta variables
-        objective = [reg_alpha]*K*J
-        lower_bounds = [0.0]*K*J
-        upper_bounds = [1e20]*K*J
-        columns = [cplex.SparsePair(ind=[c_delta_upper_indices[i],
-                                         c_delta_lower_indices[i]],
-                                    val=[-1.0, 1.0]) for i in range(K*J)]
-        model.variables.add(obj=objective,
-                            columns=columns,
-                            ub=upper_bounds,
-                            lb=lower_bounds)
-        delta_indices = range(n, n + J*K)
-
-        # Create an intercept variable
-        objective = [0.0]
-        lower_bound = [-1e20]
-        column = [cplex.SparsePair(ind=range(0, 2*n), val=[1.0]*2*n)]
-        model.variables.add(obj=objective,
-                            columns=column,
-                            lb=lower_bound)
-
-        self.model = model
-        self.y = y
-        self.reg_alpha = reg_alpha
-        self.n_estimators = n_estimators
-        self.max_leaf_nodes = max_leaf_nodes
-        self.c_epsilon_upper_indices = c_epsilon_upper_indices
-        self.c_epsilon_lower_indices = c_epsilon_lower_indices
-        self.c_delta_upper_indices = c_delta_upper_indices
-        self.c_delta_lower_indices = c_delta_lower_indices
-        self.epsilon_indices = epsilon_indices
-        self.delta_indices = delta_indices
-        self.intercept_index = n+J*K
-        self.weight_indices = []
-        self.leaves_per_tree = []
-        self.iteration = 0
+        self.design = design
+        self.residuals = residuals
+        self.dd = dd
+        self.parameters = parameters
+        self._num_previous_leaves = 0
+        self._J = J
+        self._K = K
+        self._n = n
 
     def update(self, terminal_regions, leaves):
-        """Updates the lp model. Regression problem has a new predictor
+        """Updates the solver. Regression problem has a new predictor
         for each leaf in the new tree. For each data point x, the predictor
         j has value 1 if x falls into leaf j of the new tree. It has value 0
         otherwise."""
         n = self.y.shape[0]
-        J = self.max_leaf_nodes
         L = len(leaves)
 
-        num_previous_leaves = sum(self.leaves_per_tree)
+        num_previous_leaves = np.sum(self._leaves_per_tree)
         k = num_previous_leaves
         K = self.n_estimators
-        
-        objective = [0.0]*L
-        lower_bounds = [-1e20]*L
-        columns = [cplex.SparsePair(ind=self.c_epsilon_upper_indices +
-                                    self.c_epsilon_lower_indices +
-                                    [2*n+k+l,
-                                     2*n+J*K+k+l],
-                                    val=[1.0 if terminal_region == leaves[l]
-                                         else 0.0
-                                         for terminal_region
-                                         in terminal_regions]*2
-                                    + [1.0, 1.0])
-                   for l in range(L)]
-        self.weight_indices.append(range(n + J*K + num_previous_leaves + 1,
-                                         n + J*K + num_previous_leaves + L + 1))
-        self.model.variables.add(obj=objective,
-                                 lb=lower_bounds,
-                                 columns=columns)
 
-        self.model.solve()
+        self.design[k:k+L, :n] = ([1. if terminal_region == leaves[l]
+                                   else 0.
+                                   for terminal_region in terminal_regions]
+                                  for l in range(L))
 
-        self.leaves_per_tree.append(len(leaves))
+        self.dd[k:K+L, :] = self.design[k:k+L, :].dot(np.sign(self.residuals))
+        self._num_previous_leaves += L
+
+    def solve(self):
+        """Find solution"""
+        min_dd = np.unravel_index(np.argmin(self.dd), (self._K*self._J+1, 2))
+        while self.dd[min_dd] < 0:
+            b = min_dd[0]
+            min_dd = np.unravel_index(np.argmin(self.dd),
+                                      (self._K*self._J+1, 2))
+            # find a better variable name
+            g = np.zeros(self._n+1)
+            g0 = -self.parameters[0]
+            g1 = self._design[b, :self._n].dot(self.residuals[:self._n])
+            g1 = np.fromiter((v for v, i in enumerate(g1)
+                              if self.design[b, i] != 0), dtype=np.float)
+            g1 = g1 + self._parameters[b]
+            g = np.hstack([g0, g1])
+            weights = np.full((self._n+1, 1), 1)
+            weights[0] = self.reg_alpha
+            g = np.vstack([g, weights])
+            g = g[:, g[0, :].argsort()]
 
     def get_weights(self):
         """Get the tree weights from solution of linear programming problem."""
@@ -178,24 +131,17 @@ class TortoiseBoostRegressor(BaseEstimator, RegressorMixin):
     def fit(self, X, y=None):
         # Check that X and y have correct shape
         X, y = check_X_y(X, y, accept_sparse=True)
-        self.X_ = X
-        self.y_ = y
-        n, p = self.X_.shape
-
-        # Initialize solver for LAD Lasso. We build the constraint matrix
-        # incrementally.
-        lp_solver = LP_model(y, reg_alpha=self.reg_alpha,
-                             n_estimators=self.n_estimators,
-                             max_leaf_nodes=self.max_leaf_nodes)
+        n, p = X.shape
 
         models = []
         leaves_list = []
         terminal_regions_list = []
         # Initial estimate given by median of response
         self.h0 = np.median(y)
+        K, J = len(y), self.max_leaf_nodes
+        
 
         for iteration in range(self.n_estimators):
-            residuals = np.sign(y - self.h0 - model_sum(models, X))
             # Fit a new decision tree to the psuedoresiduals
             base_model = DecisionTreeRegressor(
                 criterion='mse',
@@ -203,7 +149,7 @@ class TortoiseBoostRegressor(BaseEstimator, RegressorMixin):
                 max_leaf_nodes=self.max_leaf_nodes,
                 random_state=None,
                 presort=True)
-            base_model.fit(X, residuals)
+            base_model.fit(X, np.sign(residuals))
 
             tree = base_model.tree_
             # Extract the indices of the leaves of the tree and a list of which
