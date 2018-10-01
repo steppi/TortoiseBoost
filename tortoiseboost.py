@@ -54,6 +54,7 @@ class Solver(object):
                                 design], format='lil')
         initial = np.median(y)
         residuals = np.hstack([y, np.zeros(K*J)]) - initial
+        residuals.shape = (1, len(residuals))
         rsum = np.sum(np.sign(residuals))
         dd = np.array([-rsum,
                        rsum])
@@ -87,7 +88,14 @@ class Solver(object):
                                    else 0.
                                    for terminal_region in terminal_regions]
                                   for l in range(L)]
-        self.dd[k:k+L, :] = self.design[k:k+L, :].dot(np.sign(self.residuals))
+
+        self.dd[k:k+L, 0] = -np.sum(self.design[k:k+L, :] *
+                                    np.sign(self.residuals),
+                                    axis=1)
+        self.dd[k:k+L, 1] = np.sum(self.design[k:k+L, :] *
+                                   np.sign(self.residuals),
+                                   axis=1)
+
         self._leaves_per_tree[self._iteration] = L
         self._iteration += 1
 
@@ -98,16 +106,17 @@ class Solver(object):
             coord = min_dd[0]
             # find a better variable name
             g = np.zeros(self._n+1)
-            g0 = -self.parameters[0]
-            g1 = self._design[coord, :self._n].dot(self.residuals[:self._n])
+            g0 = -self.parameters[0][0]
+            g1 = self.design[coord, :self._n] * self.residuals[:self._n]
             g1 = np.fromiter((v for v, i in enumerate(g1)
                               if self.design[coord, i] != 0), dtype=np.float)
-            g1 = g1 + self._parameters[coord]
+            g1 = g1 + self.parameters[coord]
             g = np.hstack([g0, g1])
             weights = np.full((self._n+1, 1), 1)
             weights[0] = self.reg_alpha
             g = np.vstack([g, weights])
             g = g[:, g[0, :].argsort()]
+
             total = self._n + self.reg_alpha
             np.cumsum(g[1, :], out=g[1, :])
             index = np.searchsorted(g[1, :], total/2)
@@ -177,7 +186,7 @@ class TortoiseBoostRegressor(BaseEstimator, RegressorMixin):
                 max_leaf_nodes=self.max_leaf_nodes,
                 random_state=None,
                 presort=True)
-            base_model.fit(X, np.sign(solver.residuals[0:n]))
+            base_model.fit(X, np.sign(solver.residuals[0, 0:n]))
 
             tree = base_model.tree_
             # Extract the indices of the leaves of the tree and a list of which
