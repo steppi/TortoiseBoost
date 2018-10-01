@@ -1,4 +1,3 @@
-from __future__ import division
 import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
@@ -47,15 +46,17 @@ class Solver(object):
         J = max_leaf_nodes
         K = n_estimators
 
-        design = sparse.hstack(sparse.lil_matrix(K*J, n),
-                               self.reg_alpha * sparse.eye(K*J, format='lil'))
-        design = sparse.vstack([np.hstack(np.full(n, 1),
-                                          np.zeros(K*J)),
-                                design])
+        design = sparse.hstack([sparse.lil_matrix((K*J, n)),
+                                reg_alpha * sparse.eye(K*J, format='lil')],
+                               format='lil')
+        design = sparse.vstack([np.hstack([np.full(n, 1),
+                                           np.zeros(K*J)]),
+                                design], format='lil')
         initial = np.median(y)
         residuals = np.hstack([y, np.zeros(K*J)]) - initial
-        dd = np.array([-np.sum(np.sign(residuals)),
-                       np.sign(residuals)])
+        rsum = np.sum(np.sign(residuals))
+        dd = np.array([-rsum,
+                       rsum])
         dd = np.vstack([dd, np.full((K*J, 2), reg_alpha)])
         parameters = np.zeros(J*K+1)
         parameters[0] = initial
@@ -65,57 +66,85 @@ class Solver(object):
         self.residuals = residuals
         self.dd = dd
         self.parameters = parameters
-        self._num_previous_leaves = 0
+        self._leaves_per_tree = np.zeros(n_estimators, dtype=int)
         self._J = J
         self._K = K
         self._n = n
+        self.reg_alpha = reg_alpha
+        self._iteration = 0
 
     def update(self, terminal_regions, leaves):
         """Updates the solver. Regression problem has a new predictor
         for each leaf in the new tree. For each data point x, the predictor
         j has value 1 if x falls into leaf j of the new tree. It has value 0
         otherwise."""
-        n = self.y.shape[0]
+        n = self._n
         L = len(leaves)
 
         num_previous_leaves = np.sum(self._leaves_per_tree)
         k = num_previous_leaves
-        K = self.n_estimators
-
-        self.design[k:k+L, :n] = ([1. if terminal_region == leaves[l]
+        self.design[k:k+L, :n] = [[1. if terminal_region == leaves[l]
                                    else 0.
                                    for terminal_region in terminal_regions]
-                                  for l in range(L))
-
-        self.dd[k:K+L, :] = self.design[k:k+L, :].dot(np.sign(self.residuals))
-        self._num_previous_leaves += L
+                                  for l in range(L)]
+        self.dd[k:k+L, :] = self.design[k:k+L, :].dot(np.sign(self.residuals))
+        self._leaves_per_tree[self._iteration] = L
+        self._iteration += 1
 
     def solve(self):
         """Find solution"""
         min_dd = np.unravel_index(np.argmin(self.dd), (self._K*self._J+1, 2))
         while self.dd[min_dd] < 0:
-            b = min_dd[0]
-            min_dd = np.unravel_index(np.argmin(self.dd),
-                                      (self._K*self._J+1, 2))
+            coord = min_dd[0]
             # find a better variable name
             g = np.zeros(self._n+1)
             g0 = -self.parameters[0]
-            g1 = self._design[b, :self._n].dot(self.residuals[:self._n])
+            g1 = self._design[coord, :self._n].dot(self.residuals[:self._n])
             g1 = np.fromiter((v for v, i in enumerate(g1)
-                              if self.design[b, i] != 0), dtype=np.float)
-            g1 = g1 + self._parameters[b]
+                              if self.design[coord, i] != 0), dtype=np.float)
+            g1 = g1 + self._parameters[coord]
             g = np.hstack([g0, g1])
             weights = np.full((self._n+1, 1), 1)
             weights[0] = self.reg_alpha
             g = np.vstack([g, weights])
             g = g[:, g[0, :].argsort()]
+            total = self._n + self.reg_alpha
+            np.cumsum(g[1, :], out=g[1, :])
+            index = np.searchsorted(g[1, :], total/2)
+            new_b = g[0, index]
+            old_b = self.parameters[coord]
+            self.parameters[coord] = new_b
+            # this part will have to be rewritten in cython
+            for index in range(len(self.residuals)):
+                new_residual = (self.residuals[index] +
+                                self.design[coord, index]*(old_b - new_b))
+                old_residual = self.residuals[index]
+                if new_residual > 0 and old_residual < 0:
+                    self.dd[:, 0] = self.dd[:, 0] - 2*self.design[coord, index]
+                    self.dd[:, 1] = self.dd[:, 1] + 2*self.design[coord, index]
+                elif new_residual < 0 and old_residual > 0:
+                    self.dd[:, 0] = self.dd[:, 0] + 2*self.design[coord, index]
+                    self.dd[:, 1] = self.dd[:, 1] - 2*self.design[coord, index]
+                elif new_residual == 0:
+                    if old_residual > 0:
+                        self.dd[:, 0] == (self.dd[:, 0] +
+                                          2*self.design[coord, index])
+                    elif old_residual < 0:
+                        self.dd[:, 1] == (self.dd[:, 1] +
+                                          2*self.design[coord, index])
+                self.residuals[index] = new_residual
 
     def get_weights(self):
-        """Get the tree weights from solution of linear programming problem."""
-        values = self.model.solution.get_values()
-        weights = [[values[i] for i in s]
-                   for s in self.weight_indices]
-        intercept = values[self.intercept_index]
+        """Get the tree weights from solution"""
+        values = self.parameters
+        raw_weights = values[1:]
+        weights = []
+        intercept = values[0]
+        counter = 0
+        for i in range(self._iteration):
+            L = self._leaves_per_tree[i]
+            weights.append(raw_weights[counter:counter+L])
+            counter += L
         return (weights, intercept)
 
 
@@ -138,9 +167,8 @@ class TortoiseBoostRegressor(BaseEstimator, RegressorMixin):
         terminal_regions_list = []
         # Initial estimate given by median of response
         self.h0 = np.median(y)
-        K, J = len(y), self.max_leaf_nodes
-        
-
+        solver = Solver(y, self.reg_alpha, self.n_estimators,
+                        self.max_leaf_nodes)
         for iteration in range(self.n_estimators):
             # Fit a new decision tree to the psuedoresiduals
             base_model = DecisionTreeRegressor(
@@ -149,7 +177,7 @@ class TortoiseBoostRegressor(BaseEstimator, RegressorMixin):
                 max_leaf_nodes=self.max_leaf_nodes,
                 random_state=None,
                 presort=True)
-            base_model.fit(X, np.sign(residuals))
+            base_model.fit(X, np.sign(solver.residuals[0:n]))
 
             tree = base_model.tree_
             # Extract the indices of the leaves of the tree and a list of which
@@ -162,8 +190,8 @@ class TortoiseBoostRegressor(BaseEstimator, RegressorMixin):
 
             # Update the lp model with the new variables and constraints
             # lp_solver.update(terminal_regions, leaves, self.reg_alpha)
-            lp_solver.update(terminal_regions, leaves)
-
+            solver.update(terminal_regions, leaves)
+            solver.solve()
             # Add the tree to our list of models
             models.append(base_model)
 
@@ -172,7 +200,7 @@ class TortoiseBoostRegressor(BaseEstimator, RegressorMixin):
 
             # Update the weights of each tree based on the solution to the
             # LAD Lasso problem
-            all_weights, intercept = lp_solver.get_weights()
+            all_weights, intercept = solver.get_weights()
             for index, info in enumerate(zip(leaves_list,
                                              all_weights)):
                 model = models[index]
